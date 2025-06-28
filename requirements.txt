@@ -1,0 +1,12 @@
+python-can
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+cryptography
+pyyaml
+joblib
+pytest
+colorlog
+google-generativeai
