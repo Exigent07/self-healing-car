@@ -1,4 +1,5 @@
 import can
+import pickle
 import numpy as np
 import threading
 import time
@@ -18,12 +19,13 @@ warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 
 logger = get_logger("CAN_IDS_GATEWAY")
 
+# Load Gemini model
 genai.configure(api_key=CONFIG.get("llm", "gemini_api_key"))
-model = genai.GenerativeModel("models/gemini-2.0-flash")
+gemini_model = genai.GenerativeModel("models/gemini-2.0-flash")
 
 
 class CanIDSGateway:
-    def __init__(self, input_interface=None, output_interface=None, forward_log_path=None, post_eval_interval=None):
+    def __init__(self, model_path=None, input_interface=None, output_interface=None, forward_log_path=None, post_eval_interval=None):
         self.input_interface = input_interface or CONFIG.get("ml_ids", "input_interface", default="vcan0")
         self.output_interface = output_interface or CONFIG.get("ml_ids", "output_interface", default="vcan1")
         self.forward_log_path = forward_log_path or CONFIG.get("ml_ids", "forward_log_path", default="logs/forwarded_packets.log")
@@ -31,6 +33,15 @@ class CanIDSGateway:
         self.running = False
         self.thread = None
         self.post_eval_thread = None
+
+        model_path = model_path or CONFIG.get("ml_ids", "model_path", default="models/ids_model.pkl")
+        try:
+            with open(model_path, "rb") as f:
+                self.model = pickle.load(f)
+            logger.info(f"ML Model loaded from {model_path}")
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            raise
 
         try:
             self.input_bus = can.Bus(channel=self.input_interface, interface="socketcan")
@@ -46,23 +57,31 @@ class CanIDSGateway:
             data.append(0)
         return data
 
-    def _forward_packet(self, msg):
+    def _predict_packet(self, msg):
         try:
             can_id = msg.arbitration_id
             dlc = msg.dlc
             bytes_list = self._get_payload_data(msg)
-            self.output_bus.send(msg)
-            logger.info(f"{msg.timestamp},{can_id},{dlc},{','.join(map(str, bytes_list))}", extra={"is_forwarded_packet": True})
-            logger.info(f"[{msg.timestamp:.3f}] ID={hex(can_id)} DLC={dlc} → FORWARDED")
+            input_row = [can_id, dlc] + bytes_list
+            X = np.array(input_row).reshape(1, -1)
+            prediction = self.model.predict(X)[0]
+            label = "Normal" if prediction == 1 else "Anomaly"
+
+            if label == "Normal":
+                self.output_bus.send(msg)
+                logger.info(f"{msg.timestamp},{can_id},{dlc},{','.join(map(str, bytes_list))}", extra={"is_forwarded_packet": True})
+                logger.info(f"[{msg.timestamp:.3f}] ID={hex(can_id)} DLC={dlc} => {label} → FORWARDED")
+            else:
+                logger.warning(f"[{msg.timestamp:.3f}] ID={hex(can_id)} DLC={dlc} => {label} → BLOCKED")
         except Exception as e:
-            logger.error(f"Error forwarding packet: {e}")
+            logger.error(f"Error during ML prediction: {e}")
 
     def _listen(self):
         logger.info("Starting CAN gateway loop...")
         while self.running:
             msg = self.input_bus.recv(timeout=1.0)
             if msg:
-                self._forward_packet(msg)
+                self._predict_packet(msg)
 
     def _post_evaluation_loop(self):
         logger.info("Started post-evaluation thread.")
@@ -90,6 +109,7 @@ class CanIDSGateway:
                     can_id = int(can_id)
                     dlc = int(dlc)
                     payload = list(map(int, data))
+
                     prompt = f"""
 Give a JSON report with these fields:
 - id: the hex CAN ID
@@ -105,13 +125,12 @@ Payload: {payload}
 Log Context:
 {all_log_data}
 """
+
                     try:
-                        gemini_response = model.generate_content(prompt)
+                        gemini_response = gemini_model.generate_content(prompt)
                         response = gemini_response.text.strip()
 
-                        if isinstance(response, list):
-                            response = "".join(response)
-
+                        # Clean response
                         if response.startswith("```json"):
                             response = response[7:]
                         if response.startswith("```"):
@@ -119,28 +138,27 @@ Log Context:
                         if response.endswith("```"):
                             response = response[:-3]
 
-                        response = response.strip()
+                        result = json.loads(response.strip())
 
-                        try:
-                            result = json.loads(response)
-                            if isinstance(result, list):
-                                for item in result:
-                                    if item.get("threat_level") == "dangerous":
-                                        logger.critical(f"[{ts}] ⚠ Gemini flagged: {item}")
-                                    elif item.get("threat_level") == "suspicious":
-                                        logger.warning(f"[{ts}] ⚠ Gemini warning: {item}")
-                            elif result.get("threat_level") == "dangerous":
-                                logger.critical(f"[{ts}] ⚠ Gemini flagged: {result}")
-                            elif result.get("threat_level") == "suspicious":
-                                logger.warning(f"[{ts}] ⚠ Gemini warning: {result}")
-                        except json.JSONDecodeError:
-                            logger.error(f"Failed to parse Gemini response as JSON: {response}")
+                        if isinstance(result, list):
+                            for item in result:
+                                self._log_gemini_result(ts, item)
+                        else:
+                            self._log_gemini_result(ts, result)
+
                     except Exception as llm_error:
                         logger.error(f"Gemini LLM error: {llm_error}")
             except Exception as e:
                 logger.error(f"Post-evaluation error: {e}")
 
             time.sleep(self.post_eval_interval)
+
+    def _log_gemini_result(self, ts, result):
+        level = result.get("threat_level")
+        if level == "dangerous":
+            logger.critical(f"[{ts}] ⚠ Gemini flagged: {result}")
+        elif level == "suspicious":
+            logger.warning(f"[{ts}] ⚠ Gemini warning: {result}")
 
     def start(self):
         if self.running:
@@ -173,4 +191,3 @@ if __name__ == "__main__":
             time.sleep(1)
     except KeyboardInterrupt:
         gateway.stop()
-        
