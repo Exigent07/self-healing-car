@@ -19,7 +19,6 @@ warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 
 logger = get_logger("CAN_IDS_GATEWAY")
 
-# Load Gemini model
 genai.configure(api_key=CONFIG.get("llm", "gemini_api_key"))
 gemini_model = genai.GenerativeModel("models/gemini-2.0-flash")
 
